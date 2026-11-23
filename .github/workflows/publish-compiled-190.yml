@@ -1,0 +1,33 @@
+name: Publish verified compiled 1.9.0
+on:
+  push:
+    branches: [main]
+    paths: ['distribution/**']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: publish-compiled-190
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify compiled installer
+        working-directory: distribution
+        run: |
+          echo 'ebe73fd908c427a1fc4f265ce894c2dc47add1eee183906e610ad11a373e5ac0  Chess-Coach-1.9.0-Windows-Installer.zip' | sha256sum --check
+          test "$(stat -c%s Chess-Coach-1.9.0-Windows-Installer.zip)" = 45546071
+          sha256sum Chess-Coach-1.9.0-Windows-Installer.zip > Chess-Coach-1.9.0-Windows-Installer.zip.sha256
+      - name: Publish normal and legacy update feeds
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: distribution
+        run: |
+          gh release view v1.9.0 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create v1.9.0 --repo "$GITHUB_REPOSITORY" --title 'Chess Coach 1.9.0' --notes 'Compiled Windows release. Includes analysis during play, full Academy explanations and automatic updates. Save your current game before installing.' --latest=false
+          gh release upload v1.9.0 Chess-Coach-1.9.0-Windows-Installer.zip Chess-Coach-1.9.0-Windows-Installer.zip.sha256 --repo "$GITHUB_REPOSITORY" --clobber
+          cp Chess-Coach-1.9.0-Windows-Installer.zip Chess-Coach-Stage109-Compiled-1.9.0-Windows-Installer.zip
+          sha256sum Chess-Coach-Stage109-Compiled-1.9.0-Windows-Installer.zip > Chess-Coach-Stage109-Compiled-1.9.0-Windows-Installer.zip.sha256
+          gh release view v109.0 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create v109.0 --repo "$GITHUB_REPOSITORY" --title 'Chess Coach update for older installations' --notes 'Compatibility update for Stage 107 and 108. Installs Chess Coach 1.9.0. Modern versions use the separate 1.9.0 release.' --latest
+          gh release upload v109.0 Chess-Coach-Stage109-Compiled-1.9.0-Windows-Installer.zip Chess-Coach-Stage109-Compiled-1.9.0-Windows-Installer.zip.sha256 --repo "$GITHUB_REPOSITORY" --clobber
