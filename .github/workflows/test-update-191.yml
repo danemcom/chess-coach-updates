@@ -1,0 +1,57 @@
+name: Publish 1.9.1 automatic update test
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: test-update-191
+  cancel-in-progress: false
+jobs:
+  release:
+    if: github.repository == 'danemcom/chess-coach-updates'
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Build a version-only test update from verified compiled 1.9.0
+        shell: python
+        run: |
+          import hashlib,zipfile
+          from pathlib import Path
+          source=Path('distribution/Chess-Coach-1.9.0-Windows-Installer.zip')
+          assert hashlib.sha256(source.read_bytes()).hexdigest()=='ebe73fd908c427a1fc4f265ce894c2dc47add1eee183906e610ad11a373e5ac0'
+          target=Path('Chess-Coach-1.9.1-Windows-Installer.zip')
+          version_path='Chess-Coach-Windows-Installer/Payload/VERSION'
+          with zipfile.ZipFile(source) as src,zipfile.ZipFile(target,'w') as dst:
+              assert src.read(version_path).decode('utf-8-sig').strip()=='1.9.0'
+              for item in src.infolist():
+                  dst.writestr(item,b'1.9.1\n' if item.filename==version_path else src.read(item.filename))
+          with zipfile.ZipFile(source) as src,zipfile.ZipFile(target) as dst:
+              assert dst.testzip() is None
+              assert src.namelist()==dst.namelist()
+              changed=[n for n in src.namelist() if src.read(n)!=dst.read(n)]
+              assert changed==[version_path],changed
+              assert dst.read(version_path).strip()==b'1.9.1'
+              dst.extractall('smoke')
+          digest=hashlib.sha256(target.read_bytes()).hexdigest()
+          Path(str(target)+'.sha256').write_text(digest+'  '+target.name+'\n')
+          print('Verified only VERSION changed; compiled executables and game assets are identical.')
+          print('SHA256',digest,'SIZE',target.stat().st_size)
+      - name: Verify Windows startup and displayed version
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path 'smoke/Chess-Coach-Windows-Installer/Payload/ChessCoach.exe'
+          $version = & $exe --version
+          if ($LASTEXITCODE -ne 0 -or (($version | Out-String).Trim() -ne '1.9.1')) { throw 'Test update version check failed' }
+          & $exe --help
+          if ($LASTEXITCODE -ne 0) { throw 'Compiled app startup failed' }
+      - name: Publish complete stable update after checks pass
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create v1.9.1 Chess-Coach-1.9.1-Windows-Installer.zip Chess-Coach-1.9.1-Windows-Installer.zip.sha256 --repo "$env:GITHUB_REPOSITORY" --target "$env:GITHUB_SHA" --title 'Chess Coach 1.9.1 - Automatic update test' --notes 'Version-only test of the automatic update flow from 1.9.0 to 1.9.1. Only the installed version number changes. Compiled app code, game features and artwork are identical to 1.9.0. Windows version and startup checks passed before publication. Your saved games and settings are retained by the normal update process.' --latest=false
+          if ($LASTEXITCODE -ne 0) { throw 'Release publishing failed' }
