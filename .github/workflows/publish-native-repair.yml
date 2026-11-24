@@ -1,0 +1,98 @@
+name: Publish native updater repair 1.9.5
+'on':
+  push:
+    branches:
+    - main
+    paths:
+    - repair-195/**
+  workflow_dispatch: {}
+permissions:
+  contents: write
+concurrency:
+  group: publish-native-repair-195
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.13'
+    - name: Download native baseline for reproducible repair
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: gh release download v1.9.4 --repo "$env:GITHUB_REPOSITORY" --pattern Chess-Coach-1.9.4-Windows-Installer.zip
+        --dir base
+    - name: Package compiled repair without changing game code
+      shell: python
+      run: |
+        from pathlib import Path
+        import hashlib,zipfile
+        source=Path('base/Chess-Coach-1.9.4-Windows-Installer.zip')
+        assert hashlib.sha256(source.read_bytes()).hexdigest()=='3c4770e93f7a2f214e22ea2bc4e15d1cb42ca8026a9a6a627ba33514d970aa28'
+        worker=Path('repair-195/ChessCoach-UpdateWorker.exe')
+        worker_hash=hashlib.sha256(worker.read_bytes()).hexdigest()
+        assert worker_hash==Path(str(worker)+'.sha256').read_text().split()[0]
+        assert worker.stat().st_size>1000000
+        folder=Path('release');folder.mkdir()
+        version_path='Chess-Coach-Windows-Installer/Payload/VERSION'
+        worker_path='Chess-Coach-Windows-Installer/Payload/ChessCoach-UpdateWorker.exe'
+        target=folder/'Chess-Coach-1.9.5-Windows-Installer.zip'
+        with zipfile.ZipFile(source) as src,zipfile.ZipFile(target,'w') as dst:
+         Path('before-repair-worker.exe').write_bytes(src.read(worker_path))
+         for item in src.infolist():
+          value=b'1.9.5'+bytes([10]) if item.filename==version_path else worker.read_bytes() if item.filename==worker_path else src.read(item.filename)
+          dst.writestr(item,value)
+        with zipfile.ZipFile(source) as src,zipfile.ZipFile(target) as dst:
+         assert src.namelist()==dst.namelist() and dst.testzip() is None
+         assert set(n for n in src.namelist() if src.read(n)!=dst.read(n))=={version_path,worker_path}
+         dst.extractall('smoke')
+        Path(str(target)+'.sha256').write_text(hashlib.sha256(target.read_bytes()).hexdigest()+'  '+target.name+chr(10))
+        repair=Path('repair-tool');repair.mkdir()
+        (repair/'ChessCoach-UpdateWorker.exe').write_bytes(worker.read_bytes())
+        (repair/'ChessCoach-UpdateWorker.exe.sha256').write_text(worker_hash+'  ChessCoach-UpdateWorker.exe'+chr(10))
+        (repair/'Repair-Updater.ps1').write_text('param(\n [string]$InstallDir=(Join-Path $env:LOCALAPPDATA \'Programs\\Chess Coach\'),\n [string]$StateDir=(Join-Path $env:LOCALAPPDATA \'ChessCoach\'),\n [switch]$NoLaunch\n)\n$ErrorActionPreference=\'Stop\'\ntry {\n $expected=\'__WORKER_SHA__\'\n $source=Join-Path $PSScriptRoot \'ChessCoach-UpdateWorker.exe\'\n if((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected){throw \'The repair file did not pass its checksum. Download and extract the complete repair ZIP again.\'}\n $InstallDir=[IO.Path]::GetFullPath($InstallDir)\n $versionFile=Join-Path $InstallDir \'VERSION\'\n $version=[IO.File]::ReadAllText($versionFile).Trim()\n if($version -notin @(\'1.9.3\',\'1.9.4\',\'1.9.5\')){throw \'This repair is for the native Windows 1.9.3 installation only.\'}\n $known=@{\n  \'ChessCoach.exe\'=\'e863fb3853639e39da776ffea7feec9b05d03e119747fa49942966ab7a11ae26\'\n  \'ChessCoach-Backend.exe\'=\'4d33af6c9617f62beec6ebf8d69f5e71a7b340fc4dd16ee89cafb6d6b74c68de\'\n }\n foreach($name in $known.Keys){\n  $p=Join-Path $InstallDir $name\n  if((Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant() -ne $known[$name]){throw \'This is a different app build. The repair stopped without changing it.\'}\n }\n $wanted=@((Join-Path $InstallDir \'ChessCoach.exe\'),(Join-Path $InstallDir \'ChessCoach-Backend.exe\'),(Join-Path $InstallDir \'ChessCoach-UpdateWorker.exe\'))\n $running=@(Get-CimInstance Win32_Process -Filter "Name=\'ChessCoach.exe\' OR Name=\'ChessCoach-Backend.exe\' OR Name=\'ChessCoach-UpdateWorker.exe\'" | Where-Object {$_.ExecutablePath -and $wanted -contains $_.ExecutablePath})\n if($running.Count -gt 0){throw \'Chess Coach is still running in the background. Close it completely. If this continues, restart Windows and run this repair before opening Chess Coach.\'}\n $worker=Join-Path $InstallDir \'ChessCoach-UpdateWorker.exe\'\n $stamp=(Get-Date -Format \'yyyyMMdd-HHmmss\')+\'-\'+[guid]::NewGuid().ToString(\'N\').Substring(0,8)\n if((Get-FileHash -LiteralPath $worker -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected){\n  $temp=$worker+\'.repair-tmp\';$backup=$worker+\'.before-repair-\'+$stamp\n  Copy-Item -LiteralPath $source -Destination $temp -Force\n  if((Get-FileHash -LiteralPath $temp -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected){throw \'Repair copy failed verification. Existing updater was kept.\'}\n  [IO.File]::Replace($temp,$worker,$backup)\n  Write-Host \'Corrected updater installed. The previous updater was kept as a backup.\' -ForegroundColor Green\n }\n $receipt=Join-Path $StateDir \'updates\\receipt.json\'\n if(Test-Path -LiteralPath $receipt){\n  $record=Get-Content -LiteralPath $receipt -Raw | ConvertFrom-Json\n  if($record.state -in @(\'error\',\'rolled_back\') -and $record.blocked_version -in @(\'1.9.4\',\'1.9.5\')){\n   Move-Item -LiteralPath $receipt -Destination ($receipt+\'.before-repair-\'+$stamp)\n   Write-Host \'Previous failed-update receipt preserved. Automatic updates may retry.\'\n  }\n }\n Write-Host \'Repair complete. Saved games, settings and chess engines were not changed.\' -ForegroundColor Green\n if(-not $NoLaunch){Start-Process -FilePath (Join-Path $InstallDir \'ChessCoach.exe\') -WorkingDirectory $InstallDir}\n exit 0\n} catch {\n Write-Host (\'Repair stopped: \'+$_.Exception.Message) -ForegroundColor Red\n exit 1\n}\n'.replace('__WORKER_SHA__',worker_hash),encoding='utf-8-sig')
+        (repair/'README.txt').write_text('Chess Coach - one-time automatic update repair\n\n1. Close Chess Coach completely.\n2. Extract every file in this ZIP into a normal folder.\n3. Double-click REPAIR AUTOMATIC UPDATES.bat.\n4. Chess Coach reopens and can download version 1.9.5 automatically.\n\nIf the tool says Chess Coach is still running in the background, restart\nWindows. Then run the repair before opening Chess Coach.\n\nThis installs the corrected update worker and preserves the failed-update\nreceipt. It keeps a backup of the previous updater. It does not change your\nsaved games, settings, engines or the game code.\n\nWhy it is needed: the old worker tried to replace a Windows backend EXE\nwhile Windows still held it open. A failed updater cannot install its own\nrepair, so the installed 1.9.3 app needs this step once.\n')
+        (repair/'REPAIR AUTOMATIC UPDATES.bat').write_text('@echo off\npowershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Repair-Updater.ps1"\necho.\npause\n')
+        with zipfile.ZipFile(folder/'Chess-Coach-Automatic-Update-Repair.zip','w',zipfile.ZIP_DEFLATED) as archive:
+         for p in repair.iterdir():archive.write(p,p.name)
+        print('PASS only update worker and version changed; native app, backend and artwork identical.')
+        print('Repair worker SHA256',worker_hash)
+    - name: Verify Windows repair and native backend startup
+      shell: pwsh
+      run: |
+        $errors=$null;$tokens=$null
+        [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path 'repair-tool/Repair-Updater.ps1'),[ref]$tokens,[ref]$errors) | Out-Null
+        if($errors.Count -gt 0){throw ($errors | Out-String)}
+        $target=Join-Path $env:RUNNER_TEMP 'updater-repair-test'
+        $state=Join-Path $env:RUNNER_TEMP 'updater-repair-state'
+        New-Item -ItemType Directory -Path $target -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $state 'updates') -Force | Out-Null
+        Copy-Item 'smoke/Chess-Coach-Windows-Installer/Payload/ChessCoach.exe' $target
+        Copy-Item 'smoke/Chess-Coach-Windows-Installer/Payload/ChessCoach-Backend.exe' $target
+        Copy-Item 'before-repair-worker.exe' (Join-Path $target 'ChessCoach-UpdateWorker.exe')
+        [IO.File]::WriteAllText((Join-Path $target 'VERSION'),'1.9.3')
+        [IO.File]::WriteAllText((Join-Path $state 'updates/receipt.json'),'{{"state":"rolled_back","blocked_version":"1.9.4"}}'.Replace('{{','{').Replace('}}','}'))
+        powershell.exe -NoProfile -ExecutionPolicy Bypass -File repair-tool/Repair-Updater.ps1 -InstallDir $target -StateDir $state -NoLaunch
+        if($LASTEXITCODE -ne 0){throw 'Repair script integration test failed'}
+        if(@(Get-ChildItem -LiteralPath $target -Filter 'ChessCoach-UpdateWorker.exe.before-repair-*').Count -ne 1){throw 'Original worker backup missing'}
+        if(Test-Path (Join-Path $state 'updates/receipt.json')){throw 'Blocked receipt was not archived'}
+        if((Get-Content (Join-Path $target 'VERSION') -Raw).Trim() -ne '1.9.3'){throw 'Bootstrap changed the game version'}
+        $exe=Resolve-Path 'smoke/Chess-Coach-Windows-Installer/Payload/ChessCoach-Backend.exe'
+        $version=& $exe --version
+        if($LASTEXITCODE -ne 0 -or (($version | Out-String).Trim() -ne '1.9.5')){throw 'New package version check failed'}
+        & $exe --help
+        if($LASTEXITCODE -ne 0){throw 'Native backend startup check failed'}
+    - name: Publish repair and corrected full automatic update
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |-
+        gh release create v1.9.5 release/Chess-Coach-1.9.5-Windows-Installer.zip release/Chess-Coach-1.9.5-Windows-Installer.zip.sha256 release/Chess-Coach-Automatic-Update-Repair.zip --repo "$env:GITHUB_REPOSITORY" --title "Chess Coach 1.9.5 - Automatic update repair" --notes "Fixes native Windows executable locking during automatic updates. The worker waits for the installed native host and compiled backend wrapper to close, skips identical files, and preserves rollback and checksum verification. Game code and artwork match the working native 1.9.3 app. Existing 1.9.3 users whose update rolled back should close Chess Coach, extract Chess-Coach-Automatic-Update-Repair.zip, and run REPAIR AUTOMATIC UPDATES.bat once. Restart Windows first if the repair reports a remaining background process. Then the normal updater can install 1.9.5." --latest=false
+        if($LASTEXITCODE -ne 0){throw 'Publishing repair failed'}
+    - uses: actions/upload-artifact@v4
+      with:
+        name: native-update-repair-195
+        path: release/*
+        if-no-files-found: error
