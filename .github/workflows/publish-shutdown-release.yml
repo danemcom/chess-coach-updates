@@ -1,0 +1,37 @@
+name: Publish tested native shutdown release
+on:
+  push:
+    paths:
+      - 'release-196/**'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reassemble and verify compiled downloads
+        shell: python
+        run: |
+          import hashlib,json,zipfile
+          from pathlib import Path
+          root=Path('release-196');manifest=json.loads((root/'manifest.json').read_text())
+          assert manifest['version']=='1.9.6'
+          out=Path('release-downloads');out.mkdir()
+          for item in manifest['files']:
+              assert item['name'] in ('Chess-Coach-1.9.6-Windows-Installer.zip','ChessCoach-Setup.exe')
+              data=b''.join((root/name).read_bytes() for name in item['parts'])
+              assert len(data)==item['size'] and hashlib.sha256(data).hexdigest()==item['sha256']
+              (out/item['name']).write_bytes(data)
+              (out/(item['name']+'.sha256')).write_text(item['sha256']+'  '+item['name']+'\n')
+          with zipfile.ZipFile(out/'Chess-Coach-1.9.6-Windows-Installer.zip') as z:
+              assert z.testzip() is None
+              assert z.read('Chess-Coach-Windows-Installer/Payload/VERSION').strip()==b'1.9.6'
+              implementation=[p for p in z.namelist() if p.endswith(('.py','.pyc'))]
+              assert set(implementation)=={'Chess-Coach-Windows-Installer/Payload/'+n for n in ('server.py','automatic_updates.py','update_checker.py','update_worker.py')}
+      - name: Publish Windows installer and automatic update
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create v1.9.6 release-downloads/* --repo danemcom/chess-coach-updates --title "Chess Coach 1.9.6 - Complete app shutdown" --notes "Closing Chess Coach now also closes its backend and Stockfish engines. Includes cleanup if the window crashes, safe update restarts, and a tested upgrade from the published 1.9.5 updater. If an older version has already left background processes running, restart Windows once before installing this version. Saved games and progress are kept." --latest=false
