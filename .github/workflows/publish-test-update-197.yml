@@ -1,0 +1,37 @@
+name: Publish test update 1.9.7
+on:
+  push:
+    paths:
+      - 'release-197/**'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reassemble and verify compiled downloads
+        shell: python
+        run: |
+          import hashlib,json,zipfile
+          from pathlib import Path
+          root=Path('release-197');manifest=json.loads((root/'manifest.json').read_text())
+          assert manifest['version']=='1.9.7'
+          out=Path('release-downloads');out.mkdir()
+          for item in manifest['files']:
+              assert item['name'] in ('Chess-Coach-1.9.7-Windows-Installer.zip','ChessCoach-Setup.exe')
+              data=b''.join((root/name).read_bytes() for name in item['parts'])
+              assert len(data)==item['size'] and hashlib.sha256(data).hexdigest()==item['sha256']
+              (out/item['name']).write_bytes(data)
+              (out/(item['name']+'.sha256')).write_text(item['sha256']+'  '+item['name']+'\n')
+          with zipfile.ZipFile(out/'Chess-Coach-1.9.7-Windows-Installer.zip') as z:
+              assert z.testzip() is None
+              assert z.read('Chess-Coach-Windows-Installer/Payload/VERSION').strip()==b'1.9.7'
+              implementation=[p for p in z.namelist() if p.endswith(('.py','.pyc'))]
+              assert set(implementation)=={'Chess-Coach-Windows-Installer/Payload/'+n for n in ('server.py','automatic_updates.py','update_checker.py','update_worker.py')}
+      - name: Publish Windows installer and automatic update
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create v1.9.7 release-downloads/* --repo danemcom/chess-coach-updates --title "Chess Coach 1.9.7 - Automatic update test" --notes "Test update for automatic installation and restart from 1.9.6. Game files and compiled executables are unchanged from the tested 1.9.6 release. Windows checks verify a saved game survives the update and the backend and Stockfish close with the app." --latest=false
